@@ -8,6 +8,8 @@
 #include <csignal>
 #include <thread>
 
+#include "RtMidi.h"
+
 #define PCM_DEVICE "default"
 
 using namespace std;
@@ -73,7 +75,6 @@ vector<int16_t> full_buffer;
 
 // on sigint save wav
 void signalHandler(int signum) {
-    cout << full_buffer.size() << endl;
 
     ofstream file("output.wav", ios::out | ios::binary);
 
@@ -108,8 +109,15 @@ void signalHandler(int signum) {
     exit(0);
 }
 
-int main() {
+int main(int argc, char ** argv) {
     signal(SIGINT, signalHandler);
+
+    int midi_port = 1;
+    if (argc == 2) midi_port = (int)atoi(argv[1]);
+
+    RtMidiIn midiin;
+    midiin.openPort(midi_port);
+    midiin.ignoreTypes( false, false, false );
 
     // Initialize the shits
     unsigned int rate = 48000;
@@ -136,13 +144,15 @@ int main() {
     error(snd_pcm_hw_params_set_rate_near(
         pcm_handle, params, &rate, 0));
 
-    unsigned int periods = 4;
+
+    unsigned int periods = 1;
+    unsigned int period_time = 5000;
 
     error(snd_pcm_hw_params_set_periods_near(pcm_handle, params, &periods, 0));
-
-    unsigned int period_time = 5e5;
-
     error(snd_pcm_hw_params_set_period_time(pcm_handle, params, period_time, 0));
+
+    cout << periods << endl;
+    cout << period_time << endl;
 
     error(snd_pcm_hw_params(pcm_handle, params));
 
@@ -151,6 +161,7 @@ int main() {
 
     snd_pcm_uframes_t frames;
     snd_pcm_hw_params_get_period_size(params, &frames, 0);
+    cout << frames << endl;
 
     vector<int16_t> buffer(frames * channels);
 
@@ -159,23 +170,47 @@ int main() {
 
     const auto kb = gen_keyboard();
 
+    struct key_state {
+        bool pressed = false;
+        float timestamp = 0.0;
+    };
+
+    vector<key_state> active_keys(88);
+
+    double timestamp = 0.0;;
+
     for (int loop = 0; true; loop++) {
-        cout << loop << endl;
+
+        std::vector<unsigned char> message;
+        double stamp = midiin.getMessage( &message );
+        int nBytes = message.size();
+        for (int i=0; i<nBytes; i++ )
+            cout << "Byte " << i << " = " << (int)message[i] << ", ";
+        if ( nBytes > 0 ) {
+            timestamp += stamp;
+            cout << endl;
+        }
+        
+
+        if (nBytes  == 3) {
+            int key = message[1] - 21;
+            if (key >= 0 && key < kb.size()) {
+                if (message[0] == 144) {
+                    active_keys[key].pressed = true;
+                    active_keys[key].timestamp = timestamp;
+                }
+                else if (message[0] == 128) active_keys[key].pressed = false;
+            }
+        }
 
         for (size_t i=0;i<buffer.size();i++) {
             float t = (float)(loop*frames+i)/(float)rate;
 
-            /*
-            float val = 
-                triangle_wave(t_freq(t, kb[keyboard_note_index("A2")]))
-                /*
-                sine_wave(t_freq(t, kb[keyboard_note_index("A3")]))+
-                sine_wave(t_freq(t, kb[keyboard_note_index("E3")]))+
-                sine_wave(t_freq(t, kb[keyboard_note_index("A4")]))+
-                sine_wave(t_freq(t, kb[keyboard_note_index("C4")]))*/;
+            float val = 0.0;
 
-            float freq = pow(220, 1.0+t*0.1);
-            float val = square_wave(t_freq(t,freq));
+            for (size_t j=0;j<kb.size();j++) {
+                if (active_keys[j].pressed) val += saw_wave(t_freq(t - active_keys[j].timestamp, kb[j]));
+            } 
 
             buffer[i] = convert(val, volume);
         }
@@ -187,6 +222,7 @@ int main() {
         if (result == -EPIPE) snd_pcm_prepare(pcm_handle);
     }
 
+    //snd_seq_close(seq_handle);
     snd_pcm_drain(pcm_handle);    
     snd_pcm_close(pcm_handle);
     return 0;
