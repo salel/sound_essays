@@ -115,6 +115,9 @@ int main(int argc, char ** argv) {
     int midi_port = 1;
     if (argc == 2) midi_port = (int)atoi(argv[1]);
 
+    cout << "INFINITE PROGRAM : Ctrl-C to quit" << endl;
+    cout << "im too lazy to code proper stuff so if you get some error try putting 0 or any number as the first argument luckily it would find your midi controller" << endl;
+
     RtMidiIn midiin;
     midiin.openPort(midi_port);
     midiin.ignoreTypes( false, false, false );
@@ -173,11 +176,14 @@ int main(int argc, char ** argv) {
     struct key_state {
         bool pressed = false;
         float timestamp = 0.0;
+        bool sustained = false;
     };
 
     vector<key_state> active_keys(88);
 
-    double timestamp = 0.0;;
+    bool sustain = false;
+
+    double timestamp = 0.0;
 
     for (int loop = 0; true; loop++) {
 
@@ -198,8 +204,22 @@ int main(int argc, char ** argv) {
                 if (message[0] == 144) {
                     active_keys[key].pressed = true;
                     active_keys[key].timestamp = timestamp;
+                    if (sustain) active_keys[key].sustained = true;
                 }
                 else if (message[0] == 128) active_keys[key].pressed = false;
+                else if (message[0] == 176 && message[1] == 64) {
+                    if (message[2] == 127) {
+                        sustain = true;
+                        for (auto &k : active_keys) {
+                            if (k.pressed) k.sustained = true;
+                        }
+                    } else {
+                        sustain = false;
+                        for (auto &k : active_keys) {
+                            k.sustained = false;
+                        }
+                    }
+                }
             }
         }
 
@@ -209,7 +229,8 @@ int main(int argc, char ** argv) {
             float val = 0.0;
 
             for (size_t j=0;j<kb.size();j++) {
-                if (active_keys[j].pressed) val += saw_wave(t_freq(t - active_keys[j].timestamp, kb[j]));
+                if (active_keys[j].pressed || active_keys[j].sustained) 
+                    val += saw_wave(t_freq(t - active_keys[j].timestamp, kb[j]));
             } 
 
             buffer[i] = convert(val, volume);
