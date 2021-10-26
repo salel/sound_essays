@@ -7,8 +7,11 @@
 #include <fstream>
 #include <csignal>
 #include <thread>
+#include <map>
+#include <functional>
 
 #include "RtMidi.h"
+#include "process_args.h"
 
 #define PCM_DEVICE "default"
 
@@ -20,6 +23,8 @@ void error(unsigned int e) {
         exit(0);
     }
 }
+
+// Cute audio stuff
 
 float t_freq(float t, float freq) {
     return fmod(t*freq,1.f);
@@ -56,6 +61,7 @@ vector<float> gen_keyboard() {
     return keyboard;
 }
 
+// get keyboard note index from literals like "A#5", "Gb2", "E4" ...
 int keyboard_note_index(const char* s) {
     int len = strlen(s);
     if (len == 3 && (tolower(s[1])!='b'&&s[1]!='#')) throw "malformed note";
@@ -71,40 +77,45 @@ int keyboard_note_index(const char* s) {
     return index;
 }
 
+// for file saving
 vector<int16_t> full_buffer;
+bool save_wav = false;
+std::string save_filename = "";
 
 // on sigint save wav
 void signalHandler(int signum) {
 
-    ofstream file("output.wav", ios::out | ios::binary);
+    if (save_wav) {
+        ofstream file(save_filename.c_str(), ios::out | ios::binary);
 
-    file << "RIFF";
+        file << "RIFF";
 
-    int32_t file_size = full_buffer.size()*2 + 44;
-    int32_t fmt_len = 16;
-    int16_t fmt_type = 1;
-    int16_t fmt_channels = 1;
-    int32_t fmt_rate = 48000;
-    int32_t fmt_bits_per_sample = 16;
-    int32_t fmt_bytes_per_sample = fmt_bits_per_sample*fmt_channels/8;
-    int32_t fmt_bytes_sec = fmt_rate*fmt_bytes_per_sample;
-    int32_t data_size = full_buffer.size()*2;
+        int32_t file_size = full_buffer.size()*2 + 44;
+        int32_t fmt_len = 16;
+        int16_t fmt_type = 1;
+        int16_t fmt_channels = 1;
+        int32_t fmt_rate = 48000;
+        int32_t fmt_bits_per_sample = 16;
+        int32_t fmt_bytes_per_sample = fmt_bits_per_sample*fmt_channels/8;
+        int32_t fmt_bytes_sec = fmt_rate*fmt_bytes_per_sample;
+        int32_t data_size = full_buffer.size()*2;
 
-    file.write((char*)&file_size, sizeof(int32_t));
-    file << "WAVEfmt ";
-    file.write((char*)&fmt_len, sizeof(int32_t));
-    file.write((char*)&fmt_type, sizeof(int16_t));
-    file.write((char*)&fmt_channels, sizeof(int16_t));
-    file.write((char*)&fmt_rate, sizeof(int32_t));
-    file.write((char*)&fmt_bytes_sec, sizeof(int32_t));
-    file.write((char*)&fmt_bytes_per_sample, sizeof(int16_t));
-    file.write((char*)&fmt_bits_per_sample, sizeof(int16_t));
-    file << "data";
-    file.write((char*)&data_size, sizeof(int32_t));
+        file.write((char*)&file_size, sizeof(int32_t));
+        file << "WAVEfmt ";
+        file.write((char*)&fmt_len, sizeof(int32_t));
+        file.write((char*)&fmt_type, sizeof(int16_t));
+        file.write((char*)&fmt_channels, sizeof(int16_t));
+        file.write((char*)&fmt_rate, sizeof(int32_t));
+        file.write((char*)&fmt_bytes_sec, sizeof(int32_t));
+        file.write((char*)&fmt_bytes_per_sample, sizeof(int16_t));
+        file.write((char*)&fmt_bits_per_sample, sizeof(int16_t));
+        file << "data";
+        file.write((char*)&data_size, sizeof(int32_t));
 
-    file.write((char*)full_buffer.data(), full_buffer.size()*sizeof(int16_t));
+        file.write((char*)full_buffer.data(), full_buffer.size()*sizeof(int16_t));
 
-    file.flush();
+        file.flush();
+    }
 
     exit(0);
 }
@@ -113,16 +124,22 @@ int main(int argc, char ** argv) {
     signal(SIGINT, signalHandler);
 
     int midi_port = 1;
-    if (argc == 2) midi_port = (int)atoi(argv[1]);
+
+    // process options
+    register_arg("port", "p", "set midi controller port", [&](auto s){ midi_port = (int)atoi(s);});
+    register_arg("save", "s", "record into file", [&](auto s) {save_wav = true; save_filename = s;});
+
+    process_args(argc, argv);
 
     cout << "INFINITE PROGRAM : Ctrl-C to quit" << endl;
-    cout << "im too lazy to code proper stuff so if you get some error try putting 0 or any number as the first argument luckily it would find your midi controller" << endl;
+    cout << "If no note is registered, try changing the midi port with --port option" << endl;
 
+    // Init midi controller
     RtMidiIn midiin;
     midiin.openPort(midi_port);
     midiin.ignoreTypes( false, false, false );
 
-    // Initialize the shits
+    // Initialize audio output
     unsigned int rate = 48000;
     unsigned int channels = 1;
 
@@ -148,6 +165,7 @@ int main(int argc, char ** argv) {
         pcm_handle, params, &rate, 0));
 
 
+    // low latency
     unsigned int periods = 1;
     unsigned int period_time = 5000;
 
@@ -173,20 +191,23 @@ int main(int argc, char ** argv) {
 
     const auto kb = gen_keyboard();
 
+    // current keyboard state
     struct key_state {
-        bool pressed = false;
-        float timestamp = 0.0;
-        bool sustained = false;
+        bool pressed = false; // key physically pressed or not
+        float timestamp = 0.0; // timestamp of last press
+        bool sustained = false; // key maintained by sustain
     };
 
-    vector<key_state> active_keys(88);
+    vector<key_state> active_keys(kb.size());
 
+    // global sustain pedal state
     bool sustain = false;
 
+    // time since first key press
     double timestamp = 0.0;
 
     for (int loop = 0; true; loop++) {
-
+        // Get midi signals
         std::vector<unsigned char> message;
         double stamp = midiin.getMessage( &message );
         int nBytes = message.size();
@@ -196,11 +217,11 @@ int main(int argc, char ** argv) {
             timestamp += stamp;
             cout << endl;
         }
-        
 
+        // Process midi message
         if (nBytes  == 3) {
             int key = message[1] - 21;
-            if (key >= 0 && key < kb.size()) {
+            if (key >= 0 && key < (int)kb.size()) {
                 if (message[0] == 144) {
                     active_keys[key].pressed = true;
                     active_keys[key].timestamp = timestamp;
@@ -208,6 +229,7 @@ int main(int argc, char ** argv) {
                 }
                 else if (message[0] == 128) active_keys[key].pressed = false;
                 else if (message[0] == 176 && message[1] == 64) {
+                    // Sustain
                     if (message[2] == 127) {
                         sustain = true;
                         for (auto &k : active_keys) {
@@ -223,6 +245,7 @@ int main(int argc, char ** argv) {
             }
         }
 
+        // Generate sound
         for (size_t i=0;i<buffer.size();i++) {
             float t = (float)(loop*frames+i)/(float)rate;
 
@@ -236,14 +259,15 @@ int main(int argc, char ** argv) {
             buffer[i] = convert(val, volume);
         }
 
-        full_buffer.insert(full_buffer.end(), buffer.begin(), buffer.end());
+        // Save to file
+        if (save_wav) full_buffer.insert(full_buffer.end(), buffer.begin(), buffer.end());
 
         int result = snd_pcm_writei(pcm_handle, buffer.data(), frames);
         error(result);
+        // reload in case
         if (result == -EPIPE) snd_pcm_prepare(pcm_handle);
     }
 
-    //snd_seq_close(seq_handle);
     snd_pcm_drain(pcm_handle);    
     snd_pcm_close(pcm_handle);
     return 0;
