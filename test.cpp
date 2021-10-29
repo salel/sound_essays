@@ -15,6 +15,8 @@
 
 #define PCM_DEVICE "default"
 
+unsigned int rate = 48000;
+
 using namespace std;
 
 void error(unsigned int e) {
@@ -26,8 +28,8 @@ void error(unsigned int e) {
 
 // Cute audio stuff
 
-float t_freq(float t, float freq) {
-    return fmod(t*freq,1.f);
+float t_freq(int64_t t, float freq) {
+    return fmod((float)t*freq/rate,1.f);
 }
 
 float square_wave(float t) {
@@ -56,7 +58,7 @@ vector<float> gen_keyboard() {
     // A0 freq
     const float a0 = 440.0/16.0;
     for (size_t i=0;i<keyboard.size();i++) {
-        keyboard[i] = a0*pow(2, (float)i/12.0);
+        keyboard[i] = a0*pow(2.0, (float)i/12.0);
     }
     return keyboard;
 }
@@ -75,6 +77,20 @@ int keyboard_note_index(const char* s) {
     int index = note_map[(note-'A')] + mod + (oct - '0')*12;
     if (index < 0 || index >= 88) throw "bad range";
     return index;
+}
+
+float synth_sound(float t) {
+    auto harmonics = [](int o) {
+        return 1.f/pow(o,2.f);
+    };
+    const int num_harmonics = 4;
+
+    float val = 0.0;
+    for (int i=1;i<=num_harmonics;i++) {
+        val += sine_wave(fmod(t*i, 1.f))*harmonics(i);
+    }
+
+    return val;
 }
 
 // for file saving
@@ -140,7 +156,6 @@ int main(int argc, char ** argv) {
     midiin.ignoreTypes( false, false, false );
 
     // Initialize audio output
-    unsigned int rate = 48000;
     unsigned int channels = 1;
 
     snd_pcm_t *pcm_handle;
@@ -167,7 +182,7 @@ int main(int argc, char ** argv) {
 
     // low latency
     unsigned int periods = 1;
-    unsigned int period_time = 5000;
+    unsigned int period_time = 10000;
 
     error(snd_pcm_hw_params_set_periods_near(pcm_handle, params, &periods, 0));
     error(snd_pcm_hw_params_set_period_time(pcm_handle, params, period_time, 0));
@@ -193,20 +208,23 @@ int main(int argc, char ** argv) {
 
     // current keyboard state
     struct key_state {
-        bool pressed = false; // key physically pressed or not
-        float timestamp = 0.0; // timestamp of last press
-        bool sustained = false; // key maintained by sustain
+        bool pressed = false;
+        int64_t timestamp = 0; // timestamp of last press
+        float vol = 0.0;
+        int env_state = 4; // 0 no sound, 1 attack, 2 decay, 3 sustain, 4 release
     };
 
     vector<key_state> active_keys(kb.size());
 
     // global sustain pedal state
-    bool sustain = false;
+    bool sustain_pedal = false;
 
-    // time since first key press
-    double timestamp = 0.0;
+    const float attack = 0.05f;
+    const float decay = 0.3f;
+    const float sustain = 0.6f;
+    const float release = 0.1f;
 
-    for (int loop = 0; true; loop++) {
+    for (int64_t loop = 0; true; loop++) {
         // Get midi signals
         std::vector<unsigned char> message;
         double stamp = midiin.getMessage( &message );
@@ -214,32 +232,37 @@ int main(int argc, char ** argv) {
         for (int i=0; i<nBytes; i++ )
             cout << "Byte " << i << " = " << (int)message[i] << ", ";
         if ( nBytes > 0 ) {
-            timestamp += stamp;
-            cout << endl;
+            cout << "timestamp = " << stamp << endl;
         }
 
         // Process midi message
         if (nBytes  == 3) {
             int key = message[1] - 21;
             if (key >= 0 && key < (int)kb.size()) {
+                auto &key_s = active_keys[key];
+                auto current_timestamp = loop*frames;
                 if (message[0] == 144) {
-                    active_keys[key].pressed = true;
-                    active_keys[key].timestamp = timestamp;
-                    if (sustain) active_keys[key].sustained = true;
+                    // if quick pressed or sustain dont reset timestamp
+                    if (key_s.env_state == 0) key_s.timestamp = current_timestamp;
+                    key_s.pressed = true;
+                    key_s.env_state = 1; // set attack
                 }
-                else if (message[0] == 128) active_keys[key].pressed = false;
+                else if (message[0] == 128) {
+                    if (!sustain_pedal) {
+                        key_s.env_state = 4; // set release
+                    }
+                    key_s.pressed = false;
+                }
                 else if (message[0] == 176 && message[1] == 64) {
                     // Sustain
                     if (message[2] == 127) {
-                        sustain = true;
-                        for (auto &k : active_keys) {
-                            if (k.pressed) k.sustained = true;
-                        }
+                        sustain_pedal = true;
                     } else {
-                        sustain = false;
+                        // release all notes not pressed
                         for (auto &k : active_keys) {
-                            k.sustained = false;
+                            if (!k.pressed) k.env_state = 4;
                         }
+                        sustain_pedal = false;
                     }
                 }
             }
@@ -247,13 +270,31 @@ int main(int argc, char ** argv) {
 
         // Generate sound
         for (size_t i=0;i<buffer.size();i++) {
-            float t = (float)(loop*frames+i)/(float)rate;
+            int64_t sample_num = loop*frames+i;
 
             float val = 0.0;
 
             for (size_t j=0;j<kb.size();j++) {
-                if (active_keys[j].pressed || active_keys[j].sustained) 
-                    val += saw_wave(t_freq(t - active_keys[j].timestamp, kb[j]));
+                auto &key_s = active_keys[j];
+                int64_t note_elapsed_samples = sample_num - key_s.timestamp;
+                if (key_s.env_state > 0) {
+                    val += key_s.vol*synth_sound(t_freq(note_elapsed_samples, kb[j]));
+
+                    if (key_s.env_state == 1) {
+                        key_s.vol += 1.0/(attack*rate);
+                        if (key_s.vol >= 1.0) key_s.env_state = 2;
+                    } else if (key_s.env_state == 2) {
+                        key_s.vol -= (1.0-sustain)/(decay*rate);
+                        if (key_s.vol < sustain) key_s.env_state = 3;
+                    } else if (key_s.env_state == 3) {
+                        key_s.vol = sustain;
+                    } else if (key_s.env_state == 4) {
+                        key_s.vol -= sustain/(release*rate);
+                        if (key_s.vol <= 0.0) key_s.env_state = 0;
+                    }
+
+                    key_s.vol = min(1.f, max(0.f, key_s.vol));
+                }
             } 
 
             buffer[i] = convert(val, volume);
