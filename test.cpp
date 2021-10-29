@@ -16,6 +16,7 @@
 #define PCM_DEVICE "default"
 
 unsigned int rate = 48000;
+float a4 = 440;
 
 using namespace std;
 
@@ -37,7 +38,7 @@ float square_wave(float t) {
 }
 
 float sine_wave(float t) {
-    return sin(t*M_PI);
+    return sin(2*t*M_PI);
 }
 
 float saw_wave(float t) {
@@ -56,7 +57,7 @@ int16_t convert(float s, float volume) {
 vector<float> gen_keyboard() {
     vector<float> keyboard(88);
     // A0 freq
-    const float a0 = 440.0/16.0;
+    const float a0 = a4/16.0;
     for (size_t i=0;i<keyboard.size();i++) {
         keyboard[i] = a0*pow(2.0, (float)i/12.0);
     }
@@ -80,14 +81,15 @@ int keyboard_note_index(const char* s) {
 }
 
 float synth_sound(float t) {
-    auto harmonics = [](int o) {
-        return 1.f/pow(o,2.f);
-    };
-    const int num_harmonics = 4;
+    vector<float> harmonics = {1.0, 0.3,0.8,0.14,0.64, 0.5};
+
+    float weight = 0.0;
+    for (auto h : harmonics) weight += h;
+    weight = 1.0/weight;
 
     float val = 0.0;
-    for (int i=1;i<=num_harmonics;i++) {
-        val += sine_wave(fmod(t*i, 1.f))*harmonics(i);
+    for (size_t i=1;i<=harmonics.size();i++) {
+        val += sine_wave(fmod(t*i, 1.f))*harmonics[i-1]*weight;
     }
 
     return val;
@@ -95,13 +97,12 @@ float synth_sound(float t) {
 
 // for file saving
 vector<int16_t> full_buffer;
-bool save_wav = false;
 std::string save_filename = "";
 
 // on sigint save wav
 void signalHandler(int signum) {
 
-    if (save_wav) {
+    if (save_filename != "") {
         ofstream file(save_filename.c_str(), ios::out | ios::binary);
 
         file << "RIFF";
@@ -141,9 +142,24 @@ int main(int argc, char ** argv) {
 
     int midi_port = 1;
 
+    bool verbose = false;
+
     // process options
-    register_arg("port", "p", "set midi controller port", [&](auto s){ midi_port = (int)atoi(s);});
-    register_arg("save", "s", "record into file", [&](auto s) {save_wav = true; save_filename = s;});
+    register_arg("port", "p", "set midi controller port", [&](auto s){
+        midi_port = (int)atoi(s);
+    });
+
+    register_arg("save", "s", "record into file", [&](auto s) {
+        save_filename = s;
+    });
+
+    register_arg("tuning", "t", "set frequency of A4 in Hz (default 440Hz)", [&](auto s) {
+        a4 = atof(s);
+    });
+
+    register_arg("verbose", "v", "print debug information", [&](){
+        verbose = true;
+    });
 
     process_args(argc, argv);
 
@@ -186,10 +202,6 @@ int main(int argc, char ** argv) {
 
     error(snd_pcm_hw_params_set_periods_near(pcm_handle, params, &periods, 0));
     error(snd_pcm_hw_params_set_period_time(pcm_handle, params, period_time, 0));
-
-    cout << periods << endl;
-    cout << period_time << endl;
-
     error(snd_pcm_hw_params(pcm_handle, params));
 
     snd_pcm_hw_params_get_channels(params, &channels);
@@ -197,12 +209,17 @@ int main(int argc, char ** argv) {
 
     snd_pcm_uframes_t frames;
     snd_pcm_hw_params_get_period_size(params, &frames, 0);
-    cout << frames << endl;
+
+    if (verbose) {
+        cout << "ALSA periods : " << periods << endl;
+        cout << "ALSA period time : " << period_time << "us" << endl;
+        cout << "ALSA buffer frames : " << frames << endl;
+    }
 
     vector<int16_t> buffer(frames * channels);
 
     // ouch owie my ears
-    float volume = 0.1;
+    float volume = 0.25;
 
     const auto kb = gen_keyboard();
 
@@ -219,20 +236,23 @@ int main(int argc, char ** argv) {
     // global sustain pedal state
     bool sustain_pedal = false;
 
-    const float attack = 0.05f;
+    const float attack = 0.02f;
     const float decay = 0.3f;
     const float sustain = 0.6f;
-    const float release = 0.1f;
+    const float release = 0.05f;
 
     for (int64_t loop = 0; true; loop++) {
         // Get midi signals
         std::vector<unsigned char> message;
         double stamp = midiin.getMessage( &message );
         int nBytes = message.size();
-        for (int i=0; i<nBytes; i++ )
-            cout << "Byte " << i << " = " << (int)message[i] << ", ";
-        if ( nBytes > 0 ) {
-            cout << "timestamp = " << stamp << endl;
+        if (verbose) {
+            cout << "MIDI INPUT ";
+            for (int i=0; i<nBytes; i++ )
+                cout << "Byte " << i << " = " << (int)message[i] << ", ";
+            if ( nBytes > 0 ) {
+                cout << "timestamp = " << stamp << endl;
+            }
         }
 
         // Process midi message
@@ -301,7 +321,7 @@ int main(int argc, char ** argv) {
         }
 
         // Save to file
-        if (save_wav) full_buffer.insert(full_buffer.end(), buffer.begin(), buffer.end());
+        if (save_filename != "") full_buffer.insert(full_buffer.end(), buffer.begin(), buffer.end());
 
         int result = snd_pcm_writei(pcm_handle, buffer.data(), frames);
         error(result);
