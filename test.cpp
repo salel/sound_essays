@@ -95,6 +95,10 @@ float synth_sound(float t) {
     return val;
 }
 
+float velocity_curve(char v) {
+    return pow((float)v / 127.f, 0.5f);
+}
+
 // for file saving
 vector<int16_t> full_buffer;
 std::string save_filename = "";
@@ -228,7 +232,8 @@ int main(int argc, char ** argv) {
         bool pressed = false;
         int64_t timestamp = 0; // timestamp of last press
         float vol = 0.0;
-        int env_state = 4; // 0 no sound, 1 attack, 2 decay, 3 sustain, 4 release
+        float velocity = 0.0;
+        int env_state = 0; // 0 no sound, 1 attack, 2 decay, 3 sustain, 4 release
     };
 
     vector<key_state> active_keys(kb.size());
@@ -247,10 +252,10 @@ int main(int argc, char ** argv) {
         double stamp = midiin.getMessage( &message );
         int nBytes = message.size();
         if (verbose) {
-            cout << "MIDI INPUT ";
-            for (int i=0; i<nBytes; i++ )
-                cout << "Byte " << i << " = " << (int)message[i] << ", ";
-            if ( nBytes > 0 ) {
+            if (nBytes > 0) {
+                cout << "MIDI INPUT ";
+                for (int i=0; i<nBytes; i++ )
+                    cout << "Byte " << i << " = " << (int)message[i] << ", ";
                 cout << "timestamp = " << stamp << endl;
             }
         }
@@ -266,6 +271,7 @@ int main(int argc, char ** argv) {
                     if (key_s.env_state == 0) key_s.timestamp = current_timestamp;
                     key_s.pressed = true;
                     key_s.env_state = 1; // set attack
+                    key_s.velocity = velocity_curve(message[2]);
                 }
                 else if (message[0] == 128) {
                     if (!sustain_pedal) {
@@ -298,7 +304,8 @@ int main(int argc, char ** argv) {
                 auto &key_s = active_keys[j];
                 int64_t note_elapsed_samples = sample_num - key_s.timestamp;
                 if (key_s.env_state > 0) {
-                    val += key_s.vol*synth_sound(t_freq(note_elapsed_samples, kb[j]));
+                    val += key_s.vol*key_s.velocity*
+                        synth_sound(t_freq(note_elapsed_samples, kb[j]));
 
                     if (key_s.env_state == 1) {
                         key_s.vol += 1.0/(attack*rate);
