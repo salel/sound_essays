@@ -228,8 +228,6 @@ int main(int argc, char ** argv) {
 
     int midi_port = 1;
 
-    std::string input_mid = "";
-
     // process options
     register_arg("port", "p", "set midi controller port", [&](auto s){
         midi_port = (int)atoi(s);
@@ -249,8 +247,11 @@ int main(int argc, char ** argv) {
         verbose = true;
     });
 
+    std::string input_mid = "";
+    bool input = false;
     register_arg("input", "i", "read mid file", [&](auto s) {
         input_mid = s;
+        input = true;
     });
 
     int channel = -1;
@@ -267,7 +268,7 @@ int main(int argc, char ** argv) {
     float tempo = 120.0;
     size_t mid_file_cursor = 0;
     vector<midi_event> midi_events;
-    if (input_mid != "") midi_events = load_mid_file(input_mid);
+    if (input) midi_events = load_mid_file(input_mid);
 
     // Init midi controller
     RtMidiIn midiin;
@@ -349,7 +350,7 @@ int main(int argc, char ** argv) {
         // Get midi signals
         std::vector<unsigned char> message(1);
         while (!message.empty()) {
-            if (input_mid == "") {
+            if (!input) {
                 // Controller
                 midiin.getMessage( &message );
             } else {
