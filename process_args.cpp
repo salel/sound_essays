@@ -10,6 +10,7 @@ struct arg {
     const char* short_name;
     const char* desc;
     function<void(const char* s)> func;
+    function<void(void)> func_no_args;
     bool no_args = false;
 };
 
@@ -20,8 +21,9 @@ void register_arg(
     const char* short_name,
     const char* description,
     std::function<void(const char* s)> func,
+    std::function<void(void)> func_no_args,
     bool no_args) {
-    args.push_back({long_name, short_name, description, func, no_args});
+    args.push_back({long_name, short_name, description, func, func_no_args, no_args});
 }
 
 void register_arg(
@@ -29,7 +31,7 @@ void register_arg(
     const char* short_name,
     const char* description,
     std::function<void(const char* s)> func) {
-    register_arg(long_name, short_name, description, func, false);
+    register_arg(long_name, short_name, description, func, {}, false);
 }
 
 void register_arg(
@@ -37,7 +39,7 @@ void register_arg(
     const char* short_name,
     const char* description,
     std::function<void(void)> func) {
-    register_arg(long_name, short_name, description, [&](const char* s){func();}, true);
+    register_arg(long_name, short_name, description, {}, func, true);
 }
 
 void process_args(int argc, char ** argv) {
@@ -72,8 +74,8 @@ void process_args(int argc, char ** argv) {
                 auto ar = args[j];
                 // name matching
                 if (!used[j] && ((long_arg && strcmp(&(a[2]), ar.long_name) == 0) ||
-                    (!long_arg && strcmp(&(a[1]), ar.short_name) == 0 ))) {
-                    if (ar.no_args) ar.func(nullptr);
+                    (!long_arg && ar.short_name[0]!='\0' && strcmp(&(a[1]), ar.short_name) == 0 ))) {
+                    if (ar.no_args) ar.func_no_args();
                     else {
                         // get next arg and pass as argument to lambda
                         if (i == argc-1) print_help();

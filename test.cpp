@@ -9,6 +9,7 @@
 #include <thread>
 #include <map>
 #include <functional>
+#include <algorithm>
 
 #include "RtMidi.h"
 #include "process_args.h"
@@ -16,7 +17,6 @@
 #define PCM_DEVICE "default"
 
 unsigned int rate = 48000;
-float a4 = 440;
 
 using namespace std;
 
@@ -54,10 +54,10 @@ int16_t convert(float s, float volume) {
 }
 
 // build each root frequency of each note on a keyboard
-vector<float> gen_keyboard() {
+vector<float> gen_keyboard(float tuning) {
     vector<float> keyboard(88);
     // A0 freq
-    const float a0 = a4/16.0;
+    const float a0 = tuning/16.0;
     for (size_t i=0;i<keyboard.size();i++) {
         keyboard[i] = a0*pow(2.0, (float)i/12.0);
     }
@@ -101,12 +101,93 @@ float velocity_curve(char v) {
 
 // for file saving
 vector<int16_t> full_buffer;
+bool save = false;
 std::string save_filename = "";
+
+// verbose flag
+bool verbose = false;
+
+// Mid file input
+struct midi_event {
+    float timestamp;
+    unsigned char status, data1, data2;
+};
+
+vector<midi_event> load_mid_file(string input_mid) {
+
+    vector<midi_event> midi_events;
+
+    // Check header
+    ifstream input(input_mid, ios::in | ios::binary);
+    unsigned char header[14];
+    input.read((char*)header, 14);
+    if (strncmp((char*)header, "MThd\0\0\0\6", 8) != 0) {
+        cout << "Not a valid MID file " << header << endl;
+        exit(0);
+    }
+    short format   = (header[8 ]<<8) | header[9 ];
+    short ntracks  = (header[10]<<8) | header[11];
+    short ppqn = (header[12]<<8) | header[13];
+
+    // Read chunks
+    while (true) {
+        input.read((char*)header, 8);
+        if (input.eof()) break;
+        uint32_t length = (header[4]<<24) | (header[5] << 16) | (header[6] << 8) | header[7];
+        // Ignore non-MTrk chunks
+        if (strncmp((char*)header, "MTrk", 4) != 0) input.ignore(length);
+        vector<unsigned char> data(length);
+        input.read((char*)data.data(), length);
+        size_t c = 0;
+
+        // variable length unpacking
+        auto readVarLen = [&]() {
+            int32_t len = 0;
+            bool first_byte = true;
+            while (first_byte) {
+                len *= 0x80;
+                first_byte = (data[c] & 0x80);
+                len += (data[c] & 0x7F);
+                c += 1;
+            }
+            return len;
+        };
+
+        // midi event timestamp accumulation
+        float timestamp = 0;
+        
+        while (c < length) {
+            timestamp += readVarLen()/(float)ppqn; // add delta time from last event
+            unsigned char status = data[c++];
+            unsigned char stat4 = status>>4;
+            if (status == 0xFF) {
+                // NON MIDI EVENT
+                unsigned char status2 = data[c++];
+                int32_t len = readVarLen();
+                c += len;
+            } else {
+                // MIDI EVENT
+                midi_event evt = {timestamp, status, data[c], 0};
+                if (stat4 == 0xC) c += 1;
+                else {
+                    evt.data2 = data[c+1];
+                    c += 2;
+                }
+                midi_events.push_back(evt);
+            }
+        }
+    }
+
+    // sort in ascending timestamp
+    sort(midi_events.begin(), midi_events.end(), [](auto a, auto b){
+        return a.timestamp < b.timestamp;});
+    return midi_events;
+}
 
 // on sigint save wav
 void signalHandler(int signum) {
 
-    if (save_filename != "") {
+    if (save) {
         ofstream file(save_filename.c_str(), ios::out | ios::binary);
 
         file << "RIFF";
@@ -136,6 +217,7 @@ void signalHandler(int signum) {
         file.write((char*)full_buffer.data(), full_buffer.size()*sizeof(int16_t));
 
         file.flush();
+        if (verbose) cout << save_filename << " saved." << endl;
     }
 
     exit(0);
@@ -146,17 +228,19 @@ int main(int argc, char ** argv) {
 
     int midi_port = 1;
 
-    bool verbose = false;
+    std::string input_mid = "";
 
     // process options
     register_arg("port", "p", "set midi controller port", [&](auto s){
         midi_port = (int)atoi(s);
     });
 
-    register_arg("save", "s", "record into file", [&](auto s) {
+    register_arg("output", "o", "record into file", [&](auto s) {
+        save = true;
         save_filename = s;
     });
 
+    float a4 = 440;
     register_arg("tuning", "t", "set frequency of A4 in Hz (default 440Hz)", [&](auto s) {
         a4 = atof(s);
     });
@@ -165,10 +249,25 @@ int main(int argc, char ** argv) {
         verbose = true;
     });
 
+    register_arg("input", "i", "read mid file", [&](auto s) {
+        input_mid = s;
+    });
+
+    int channel = -1;
+    register_arg("channel", "c", "read from midi channel (ALL, 0-15), whether from file or controller", [&](auto s) {
+        if (strcmp(s, "ALL")==0) channel = -1;
+        else channel = min(15, max(0, atoi(s)));
+    });
+
     process_args(argc, argv);
 
     cout << "INFINITE PROGRAM : Ctrl-C to quit" << endl;
     cout << "If no note is registered, try changing the midi port with --port option" << endl;
+
+    float tempo = 120.0;
+    size_t mid_file_cursor = 0;
+    vector<midi_event> midi_events;
+    if (input_mid != "") midi_events = load_mid_file(input_mid);
 
     // Init midi controller
     RtMidiIn midiin;
@@ -225,7 +324,7 @@ int main(int argc, char ** argv) {
     // ouch owie my ears
     float volume = 0.25;
 
-    const auto kb = gen_keyboard();
+    const auto kb = gen_keyboard(a4);
 
     // current keyboard state
     struct key_state {
@@ -248,47 +347,63 @@ int main(int argc, char ** argv) {
 
     for (int64_t loop = 0; true; loop++) {
         // Get midi signals
-        std::vector<unsigned char> message;
-        double stamp = midiin.getMessage( &message );
-        int nBytes = message.size();
-        if (verbose) {
-            if (nBytes > 0) {
-                cout << "MIDI INPUT ";
-                for (int i=0; i<nBytes; i++ )
-                    cout << "Byte " << i << " = " << (int)message[i] << ", ";
-                cout << "timestamp = " << stamp << endl;
-            }
-        }
-
-        // Process midi message
-        if (nBytes  == 3) {
-            int key = message[1] - 21;
-            if (key >= 0 && key < (int)kb.size()) {
-                auto &key_s = active_keys[key];
-                auto current_timestamp = loop*frames;
-                if (message[0] == 144) {
-                    // if quick pressed or sustain dont reset timestamp
-                    if (key_s.env_state == 0) key_s.timestamp = current_timestamp;
-                    key_s.pressed = true;
-                    key_s.env_state = 1; // set attack
-                    key_s.velocity = velocity_curve(message[2]);
-                }
-                else if (message[0] == 128) {
-                    if (!sustain_pedal) {
-                        key_s.env_state = 4; // set release
+        std::vector<unsigned char> message(1);
+        while (!message.empty()) {
+            if (input_mid == "") {
+                // Controller
+                midiin.getMessage( &message );
+            } else {
+                // Mid file
+                message.clear();
+                if (mid_file_cursor < midi_events.size()) {
+                    auto msg = midi_events[mid_file_cursor];
+                    // math magic to convert midi timestamp to sample number
+                    if ((60/tempo)*msg.timestamp <= ((loop*frames)/(float)rate)) {
+                        message = {msg.status, msg.data1, msg.data2};
+                        mid_file_cursor++;
                     }
-                    key_s.pressed = false;
                 }
-                else if (message[0] == 176 && message[1] == 64) {
-                    // Sustain
-                    if (message[2] == 127) {
-                        sustain_pedal = true;
-                    } else {
-                        // release all notes not pressed
-                        for (auto &k : active_keys) {
-                            if (!k.pressed) k.env_state = 4;
+            }
+
+            if (verbose) {
+                if (message.size() > 0) {
+                    cout << "MIDI INPUT ";
+                    for (size_t i=0; i<message.size(); i++ )
+                        cout << "Byte " << i << " = " << hex << (int)message[i] << ", ";
+                    cout << endl;
+                }
+            }
+
+            // Process midi message
+            if (message.size()  == 3) {
+                int key = message[1] - 21;
+                if (key >= 0 && key < (int)kb.size()) {
+                    auto &key_s = active_keys[key];
+                    auto current_timestamp = loop*frames;
+                    if ((message[0] == 0x90+channel) || (channel==-1 && (message[0]&0xF0)==0x90)) {
+                        // if quick pressed or sustain dont reset timestamp
+                        if (key_s.env_state == 0) key_s.timestamp = current_timestamp;
+                        key_s.pressed = true;
+                        key_s.env_state = 1; // set attack
+                        key_s.velocity = velocity_curve(message[2]);
+                    }
+                    else if (message[0] == 0x80+channel || (channel==-1 && (message[0]&0xF0)==0x80)) {
+                        if (!sustain_pedal) {
+                            key_s.env_state = 4; // set release
                         }
-                        sustain_pedal = false;
+                        key_s.pressed = false;
+                    }
+                    else if ((message[0] == (0xB0 + channel) || (channel==-1 && (message[0]&0xF0)==0xB0)    ) && message[1] == 64) {
+                        // Sustain
+                        if (message[2] == 127) {
+                            sustain_pedal = true;
+                        } else {
+                            // release all notes not pressed
+                            for (auto &k : active_keys) {
+                                if (!k.pressed) k.env_state = 4;
+                            }
+                            sustain_pedal = false;
+                        }
                     }
                 }
             }
@@ -307,6 +422,7 @@ int main(int argc, char ** argv) {
                     val += key_s.vol*key_s.velocity*
                         synth_sound(t_freq(note_elapsed_samples, kb[j]));
 
+                    // State machine for ADSR pattern
                     if (key_s.env_state == 1) {
                         key_s.vol += 1.0/(attack*rate);
                         if (key_s.vol >= 1.0) key_s.env_state = 2;
@@ -328,7 +444,7 @@ int main(int argc, char ** argv) {
         }
 
         // Save to file
-        if (save_filename != "") full_buffer.insert(full_buffer.end(), buffer.begin(), buffer.end());
+        if (save) full_buffer.insert(full_buffer.end(), buffer.begin(), buffer.end());
 
         int result = snd_pcm_writei(pcm_handle, buffer.data(), frames);
         error(result);
